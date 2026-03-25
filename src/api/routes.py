@@ -9,10 +9,11 @@ import re
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import verify_api_key_flexible
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -28,6 +29,8 @@ router = APIRouter()
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+IMAGE_RESPONSE_ENCODING_HEADER = "X-Flow2API-Image-Encoding"
+APPLIED_IMAGE_RESPONSE_ENCODING_HEADER = "X-Flow2API-Image-Encoding-Applied"
 GEMINI_STATUS_MAP = {
     400: "INVALID_ARGUMENT",
     401: "UNAUTHENTICATED",
@@ -53,6 +56,7 @@ class NormalizedGenerationRequest:
     prompt: str
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
+    response_image_encoding: str = "url"
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -65,6 +69,34 @@ def _ensure_generation_handler() -> GenerationHandler:
     if generation_handler is None:
         raise HTTPException(status_code=500, detail="Generation handler not initialized")
     return generation_handler
+
+
+def _normalize_image_response_encoding(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"url", "base64"}:
+        return normalized
+    return "url"
+
+
+def _resolve_image_response_encoding(
+    body_value: Optional[str],
+    header_value: Optional[str],
+) -> str:
+    for candidate in (body_value, header_value):
+        if candidate is None:
+            continue
+        normalized = _normalize_image_response_encoding(candidate)
+        if normalized != str(candidate).strip().lower():
+            raise HTTPException(
+                status_code=400,
+                detail="responseImageEncoding must be 'url' or 'base64'",
+            )
+        return normalized
+    return config.response_image_encoding
+
+
+def _build_response_encoding_headers(image_response_encoding: str) -> Dict[str, str]:
+    return {APPLIED_IMAGE_RESPONSE_ENCODING_HEADER: image_response_encoding}
 
 
 def _build_model_description(model_config: Dict[str, Any]) -> str:
@@ -189,6 +221,41 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
         debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
 
     return None
+
+
+async def _convert_image_uri_to_data_url(uri: str) -> str:
+    if not uri or uri.startswith("data:image"):
+        return uri
+
+    image_bytes = await retrieve_image_data(uri)
+    if not image_bytes:
+        return uri
+
+    mime_type = _detect_image_mime_type(
+        image_bytes,
+        fallback=_guess_mime_type(uri, "image/png"),
+    )
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+async def _rewrite_markdown_image_uris(content: str, image_response_encoding: str) -> str:
+    if image_response_encoding != "base64" or not content:
+        return content
+
+    matches = list(MARKDOWN_IMAGE_RE.finditer(content))
+    if not matches:
+        return content
+
+    rebuilt: List[str] = []
+    cursor = 0
+    for match in matches:
+        uri_start, uri_end = match.span(1)
+        rebuilt.append(content[cursor:uri_start])
+        rebuilt.append(await _convert_image_uri_to_data_url(match.group(1)))
+        cursor = uri_end
+    rebuilt.append(content[cursor:])
+    return "".join(rebuilt)
 
 
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
@@ -337,7 +404,12 @@ def _resolve_request_model(model: str, request: Any) -> str:
 
 async def _normalize_openai_request(
     request: ChatCompletionRequest,
+    header_image_response_encoding: Optional[str] = None,
 ) -> NormalizedGenerationRequest:
+    response_image_encoding = _resolve_image_response_encoding(
+        request.responseImageEncoding,
+        header_image_response_encoding,
+    )
     if request.messages:
         prompt, images = await _extract_prompt_and_images_from_openai_messages(
             request.messages
@@ -351,14 +423,20 @@ async def _normalize_openai_request(
             prompt=prompt,
             images=images,
             messages=request.messages,
+            response_image_encoding=response_image_encoding,
         )
 
     if request.contents:
         gemini_request = GeminiGenerateContentRequest(
             contents=_coerce_gemini_contents(request.contents),
             generationConfig=request.generationConfig,
+            responseImageEncoding=request.responseImageEncoding,
         )
-        normalized = await _normalize_gemini_request(request.model, gemini_request)
+        normalized = await _normalize_gemini_request(
+            request.model,
+            gemini_request,
+            header_image_response_encoding=header_image_response_encoding,
+        )
         normalized.messages = request.messages
         return normalized
 
@@ -368,16 +446,23 @@ async def _normalize_openai_request(
 async def _normalize_gemini_request(
     model: str,
     request: GeminiGenerateContentRequest,
+    header_image_response_encoding: Optional[str] = None,
 ) -> NormalizedGenerationRequest:
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
     if system_instruction:
         prompt = f"{system_instruction}\n\n{prompt}".strip()
 
+    response_image_encoding = _resolve_image_response_encoding(
+        request.responseImageEncoding,
+        header_image_response_encoding,
+    )
+
     return NormalizedGenerationRequest(
         model=_resolve_request_model(model, request),
         prompt=prompt,
         images=images,
+        response_image_encoding=response_image_encoding,
     )
 
 
@@ -421,8 +506,39 @@ def _get_error_status_code(payload: Dict[str, Any]) -> int:
     return 200
 
 
-def _build_openai_json_response(payload: Dict[str, Any]) -> JSONResponse:
-    return JSONResponse(content=payload, status_code=_get_error_status_code(payload))
+async def _apply_openai_image_response_encoding(
+    payload: Dict[str, Any],
+    image_response_encoding: str,
+) -> Dict[str, Any]:
+    if image_response_encoding != "base64" or "error" in payload:
+        return payload
+
+    choices = payload.get("choices", [])
+    if not choices:
+        return payload
+
+    choice = choices[0]
+    for container_key in ("message", "delta"):
+        container = choice.get(container_key, {})
+        content = container.get("content")
+        if not isinstance(content, str):
+            continue
+        container["content"] = await _rewrite_markdown_image_uris(
+            content,
+            image_response_encoding,
+        )
+    return payload
+
+
+def _build_openai_json_response(
+    payload: Dict[str, Any],
+    image_response_encoding: str,
+) -> JSONResponse:
+    return JSONResponse(
+        content=payload,
+        status_code=_get_error_status_code(payload),
+        headers=_build_response_encoding_headers(image_response_encoding),
+    )
 
 
 def _build_gemini_error_payload(status_code: int, message: str) -> Dict[str, Any]:
@@ -455,7 +571,20 @@ def _extract_openai_message_content(payload: Dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
+async def _build_image_parts_from_uri(
+    uri: str,
+    image_response_encoding: str,
+) -> List[Dict[str, Any]]:
+    if image_response_encoding == "url" and not uri.startswith("data:image"):
+        return [
+            {
+                "fileData": {
+                    "mimeType": _guess_mime_type(uri, "image/png"),
+                    "fileUri": uri,
+                }
+            }
+        ]
+
     if uri.startswith("data:image"):
         mime_type, _ = _decode_data_url(uri)
         match = DATA_URL_RE.match(uri)
@@ -500,6 +629,13 @@ def _build_video_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
 
 
 async def _build_gemini_parts_from_output(output: str) -> List[Dict[str, Any]]:
+    return await _build_gemini_parts_from_output_with_encoding(output, "base64")
+
+
+async def _build_gemini_parts_from_output_with_encoding(
+    output: str,
+    image_response_encoding: str,
+) -> List[Dict[str, Any]]:
     if not output:
         return []
 
@@ -507,7 +643,7 @@ async def _build_gemini_parts_from_output(output: str) -> List[Dict[str, Any]]:
     if image_matches:
         parts: List[Dict[str, Any]] = []
         for uri in image_matches:
-            parts.extend(await _build_image_parts_from_uri(uri))
+            parts.extend(await _build_image_parts_from_uri(uri, image_response_encoding))
         return parts
 
     video_matches = HTML_VIDEO_RE.findall(output)
@@ -523,6 +659,7 @@ async def _build_gemini_parts_from_output(output: str) -> List[Dict[str, Any]]:
 async def _build_gemini_success_payload(
     payload: Dict[str, Any],
     response_model: str,
+    image_response_encoding: str,
 ) -> Dict[str, Any]:
     output = _extract_openai_message_content(payload)
     return {
@@ -530,7 +667,10 @@ async def _build_gemini_success_payload(
             {
                 "content": {
                     "role": "model",
-                    "parts": await _build_gemini_parts_from_output(output),
+                    "parts": await _build_gemini_parts_from_output_with_encoding(
+                        output,
+                        image_response_encoding,
+                    ),
                 },
                 "finishReason": "STOP",
                 "index": 0,
@@ -554,6 +694,7 @@ def _normalize_finish_reason(reason: Optional[str]) -> Optional[str]:
 async def _convert_openai_stream_chunk_to_gemini_event(
     payload: Dict[str, Any],
     response_model: str,
+    image_response_encoding: str,
 ) -> Optional[str]:
     choices = payload.get("choices", [])
     if not choices:
@@ -568,7 +709,10 @@ async def _convert_openai_stream_chunk_to_gemini_event(
     if text:
         candidate["content"] = {
             "role": "model",
-            "parts": await _build_gemini_parts_from_output(text),
+            "parts": await _build_gemini_parts_from_output_with_encoding(
+                text,
+                image_response_encoding,
+            ),
         }
     if finish_reason:
         candidate["finishReason"] = finish_reason
@@ -594,10 +738,21 @@ async def _iterate_openai_stream(
         stream=True,
     ):
         if chunk.startswith("data: "):
-            yield chunk
+            payload_text = chunk[6:].strip()
+            if payload_text == "[DONE]":
+                yield chunk
+                continue
+            payload = await _apply_openai_image_response_encoding(
+                _parse_handler_result(payload_text),
+                normalized.response_image_encoding,
+            )
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             continue
 
-        payload = _parse_handler_result(chunk)
+        payload = await _apply_openai_image_response_encoding(
+            _parse_handler_result(chunk),
+            normalized.response_image_encoding,
+        )
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
@@ -628,6 +783,7 @@ async def _iterate_gemini_stream(
             event = await _convert_openai_stream_chunk_to_gemini_event(
                 payload,
                 response_model,
+                normalized.response_image_encoding,
             )
             if event:
                 yield event
@@ -643,6 +799,7 @@ async def _iterate_gemini_stream(
         event = await _convert_openai_stream_chunk_to_gemini_event(
             payload,
             response_model,
+            normalized.response_image_encoding,
         )
         if event:
             yield event
@@ -713,11 +870,18 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
 @router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
+    x_flow2api_image_encoding: Optional[str] = Header(
+        None,
+        alias=IMAGE_RESPONSE_ENCODING_HEADER,
+    ),
     api_key: str = Depends(verify_api_key_flexible),
 ):
     """OpenAI-compatible unified generation endpoint."""
     try:
-        normalized = await _normalize_openai_request(request)
+        normalized = await _normalize_openai_request(
+            request,
+            header_image_response_encoding=x_flow2api_image_encoding,
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
@@ -729,17 +893,26 @@ async def create_chat_completion(
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
+                    **_build_response_encoding_headers(
+                        normalized.response_image_encoding
+                    ),
                 },
             )
 
-        payload = _parse_handler_result(
-            await _collect_non_stream_result(
-                normalized.model,
-                normalized.prompt,
-                normalized.images,
-            )
+        payload = await _apply_openai_image_response_encoding(
+            _parse_handler_result(
+                await _collect_non_stream_result(
+                    normalized.model,
+                    normalized.prompt,
+                    normalized.images,
+                )
+            ),
+            normalized.response_image_encoding,
         )
-        return _build_openai_json_response(payload)
+        return _build_openai_json_response(
+            payload,
+            normalized.response_image_encoding,
+        )
 
     except HTTPException:
         raise
@@ -752,11 +925,19 @@ async def create_chat_completion(
 async def generate_content(
     model: str,
     request: GeminiGenerateContentRequest,
+    x_flow2api_image_encoding: Optional[str] = Header(
+        None,
+        alias=IMAGE_RESPONSE_ENCODING_HEADER,
+    ),
     api_key: str = Depends(verify_api_key_flexible),
 ):
     """Gemini official generateContent endpoint."""
     try:
-        normalized = await _normalize_gemini_request(model, request)
+        normalized = await _normalize_gemini_request(
+            model,
+            request,
+            header_image_response_encoding=x_flow2api_image_encoding,
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
@@ -771,7 +952,14 @@ async def generate_content(
             return _build_gemini_error_response_from_handler(payload)
 
         return JSONResponse(
-            content=await _build_gemini_success_payload(payload, model)
+            content=await _build_gemini_success_payload(
+                payload,
+                model,
+                normalized.response_image_encoding,
+            ),
+            headers=_build_response_encoding_headers(
+                normalized.response_image_encoding
+            ),
         )
 
     except HTTPException as exc:
@@ -792,11 +980,19 @@ async def stream_generate_content(
     model: str,
     request: GeminiGenerateContentRequest,
     alt: Optional[str] = Query(None),
+    x_flow2api_image_encoding: Optional[str] = Header(
+        None,
+        alias=IMAGE_RESPONSE_ENCODING_HEADER,
+    ),
     api_key: str = Depends(verify_api_key_flexible),
 ):
     """Gemini official streamGenerateContent endpoint."""
     try:
-        normalized = await _normalize_gemini_request(model, request)
+        normalized = await _normalize_gemini_request(
+            model,
+            request,
+            header_image_response_encoding=x_flow2api_image_encoding,
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
@@ -807,6 +1003,9 @@ async def stream_generate_content(
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **_build_response_encoding_headers(
+                    normalized.response_image_encoding
+                ),
             },
         )
     except HTTPException as exc:

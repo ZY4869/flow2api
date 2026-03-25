@@ -1,10 +1,11 @@
 """Admin API routes"""
 import asyncio
 import json
+import os
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import secrets
 import time
 import re
@@ -28,6 +29,8 @@ concurrency_manager: Optional[ConcurrencyManager] = None
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
+HEADED_CAPTCHA_METHODS = {"browser", "personal"}
+SUPPORTED_SCORE_TEST_METHODS = SUPPORTED_API_CAPTCHA_METHODS | HEADED_CAPTCHA_METHODS | {"remote_browser"}
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -153,6 +156,89 @@ def _build_proxy_map(proxy_url: str) -> Optional[Dict[str, str]]:
     if not normalized:
         return None
     return {"http": normalized, "https": normalized}
+
+
+def _is_truthy_env(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_running_in_docker() -> bool:
+    if os.path.exists("/.dockerenv"):
+        return True
+
+    try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8") as file:
+            content = file.read()
+            if any(marker in content for marker in ("docker", "kubepods", "containerd")):
+                return True
+    except Exception:
+        pass
+
+    return bool(os.environ.get("DOCKER_CONTAINER") or os.environ.get("KUBERNETES_SERVICE_HOST"))
+
+
+def _get_captcha_method_runtime(method: Optional[str]) -> Dict[str, Any]:
+    normalized_method = (method or "").strip().lower()
+    is_headed_method = normalized_method in HEADED_CAPTCHA_METHODS
+    is_docker = _is_running_in_docker()
+    allow_docker_headed = (
+        _is_truthy_env("ALLOW_DOCKER_HEADED_CAPTCHA")
+        or _is_truthy_env("ALLOW_DOCKER_BROWSER_CAPTCHA")
+    )
+    display_configured = bool((os.environ.get("DISPLAY") or "").strip())
+    docker_headed_blocked = is_headed_method and is_docker and not allow_docker_headed
+    requires_display = is_headed_method and is_docker and allow_docker_headed
+    available = True
+    message = ""
+    suggested_command = ""
+
+    if normalized_method and normalized_method not in SUPPORTED_SCORE_TEST_METHODS:
+        available = False
+        message = f"当前打码方式不支持分数测试: {normalized_method}"
+    elif docker_headed_blocked:
+        available = False
+        suggested_command = "docker compose -f docker-compose.headed.yml up -d --build"
+        message = (
+            "检测到 Docker 默认环境，已禁用 browser/personal 有头打码。"
+            "如需启用，请改用 docker-compose.headed.yml，或设置 "
+            "ALLOW_DOCKER_HEADED_CAPTCHA=true 并提供 DISPLAY/Xvfb。"
+        )
+    elif requires_display and not display_configured:
+        available = False
+        suggested_command = "docker compose -f docker-compose.headed.yml up -d --build"
+        message = (
+            "Docker 有头打码已启用，但 DISPLAY 未设置。"
+            "请设置 DISPLAY（例如 :99）并启动 Xvfb，或直接使用 docker-compose.headed.yml。"
+        )
+
+    return {
+        "method": normalized_method,
+        "is_headed": is_headed_method,
+        "score_test_supported": normalized_method in SUPPORTED_SCORE_TEST_METHODS,
+        "available": available,
+        "is_docker": is_docker,
+        "allow_docker_headed": allow_docker_headed,
+        "display_configured": display_configured,
+        "docker_headed_blocked": docker_headed_blocked,
+        "message": message,
+        "suggested_command": suggested_command,
+    }
+
+
+def _build_captcha_runtime_map() -> Dict[str, Dict[str, Any]]:
+    return {
+        method: _get_captcha_method_runtime(method)
+        for method in (
+            "yescaptcha",
+            "capmonster",
+            "ezcaptcha",
+            "capsolver",
+            "browser",
+            "personal",
+            "remote_browser",
+        )
+    }
 
 
 def _normalize_http_base_url(base_url: str) -> str:
@@ -436,6 +522,10 @@ class GenerationConfigRequest(BaseModel):
 
 class CallLogicConfigRequest(BaseModel):
     call_mode: str
+
+
+class ResponseConfigRequest(BaseModel):
+    image_encoding: Literal["url", "base64"]
 
 
 class ChangePasswordRequest(BaseModel):
@@ -1318,6 +1408,37 @@ async def update_generation_timeout(
     return {"success": True, "message": "生成配置更新成功"}
 
 
+# ========== Response Configuration Endpoints ==========
+
+@router.get("/api/response/config")
+async def get_response_config(token: str = Depends(verify_admin_token)):
+    """Get response configuration."""
+    response_config = await db.get_response_config()
+    return {
+        "success": True,
+        "config": {
+            "image_encoding": response_config.image_encoding,
+        }
+    }
+
+
+@router.post("/api/response/config")
+async def update_response_config(
+    request: ResponseConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update response configuration."""
+    await db.update_response_config(request.image_encoding)
+    await db.reload_config_to_memory()
+    return {
+        "success": True,
+        "message": "图片返回编码配置保存成功",
+        "config": {
+            "image_encoding": request.image_encoding,
+        }
+    }
+
+
 # ========== AT Auto Refresh Config ==========
 
 @router.get("/api/token-refresh/config")
@@ -1355,7 +1476,7 @@ async def get_cache_config(token: str = Depends(verify_admin_token)):
     cache_config = await db.get_cache_config()
 
     # Calculate effective base URL
-    effective_base_url = cache_config.cache_base_url if cache_config.cache_base_url else f"http://127.0.0.1:8000"
+    effective_base_url = cache_config.cache_base_url if cache_config.cache_base_url else f"http://127.0.0.1:8081"
 
     return {
         "success": True,
@@ -1511,6 +1632,7 @@ async def update_captcha_config(
 async def get_captcha_config(token: str = Depends(verify_admin_token)):
     """Get captcha configuration"""
     captcha_config = await db.get_captcha_config()
+    captcha_runtime = _build_captcha_runtime_map()
     return {
         "captcha_method": captcha_config.captcha_method,
         "yescaptcha_api_key": captcha_config.yescaptcha_api_key,
@@ -1526,7 +1648,8 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
-        "browser_count": captcha_config.browser_count
+        "browser_count": captcha_config.browser_count,
+        "captcha_runtime": captcha_runtime,
     }
 
 
@@ -1546,6 +1669,7 @@ async def test_captcha_score(
     started_at = time.time()
     captcha_config = await db.get_captcha_config()
     captcha_method = (captcha_config.captcha_method or config.captcha_method or "").strip().lower()
+    captcha_runtime = _get_captcha_method_runtime(captcha_method)
     browser_proxy_enabled = bool(captcha_config.browser_proxy_enabled)
     browser_proxy_url = captcha_config.browser_proxy_url or ""
 
@@ -1564,6 +1688,20 @@ async def test_captcha_score(
     verify_mode = "browser_page" if page_verify_only else "server_post"
 
     try:
+        if not captcha_runtime.get("available", True):
+            return {
+                "success": False,
+                "message": captcha_runtime.get("message") or "当前环境不支持该打码方式",
+                "captcha_method": captcha_method,
+                "website_url": website_url,
+                "website_key": website_key,
+                "action": action,
+                "verify_url": verify_url,
+                "enterprise": enterprise,
+                "token_acquired": False,
+                "runtime": captcha_runtime,
+                "elapsed_ms": int((time.time() - started_at) * 1000),
+            }
         token_start = time.time()
         if captcha_method == "browser":
             from ..services.browser_captcha import BrowserCaptchaService
@@ -1652,6 +1790,7 @@ async def test_captcha_score(
                 "verify_url": verify_url,
                 "enterprise": enterprise,
                 "token_acquired": False,
+                "runtime": captcha_runtime,
                 "elapsed_ms": int((time.time() - started_at) * 1000)
             }
         if token_elapsed_ms <= 0:
@@ -1678,6 +1817,7 @@ async def test_captcha_score(
                 "browser_proxy_enabled": browser_proxy_enabled,
                 "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
                 "fingerprint": fingerprint,
+                "runtime": captcha_runtime,
                 "elapsed_ms": int((time.time() - started_at) * 1000)
             }
 
@@ -1792,6 +1932,7 @@ async def test_captcha_score(
             "browser_proxy_enabled": browser_proxy_enabled,
             "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
             "fingerprint": fingerprint,
+            "runtime": captcha_runtime,
             "elapsed_ms": int((time.time() - started_at) * 1000)
         }
     except Exception as e:
@@ -1828,6 +1969,7 @@ async def test_captcha_score(
             "browser_proxy_enabled": browser_proxy_enabled,
             "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
             "fingerprint": fingerprint,
+            "runtime": captcha_runtime,
             "elapsed_ms": int((time.time() - started_at) * 1000)
         }
 

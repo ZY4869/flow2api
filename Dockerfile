@@ -8,6 +8,6 @@ RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8081
 
 CMD ["python", "main.py"]

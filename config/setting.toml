@@ -26,7 +26,7 @@ max_poll_attempts = 200
 
 [server]
 host = "0.0.0.0"
-port = 8000
+port = 8081
 
 [debug]
 enabled = false
@@ -52,6 +52,9 @@ error_ban_threshold = 3
 enabled = false
 timeout = 7200  # 缓存超时时间(秒), 默认2小时
 base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
+
+[response]
+image_encoding = "url"  # image response encoding: url/base64
 
 [captcha]
 captcha_method = "browser"  # 打码方式: yescaptcha/browser/personal/remote_browser

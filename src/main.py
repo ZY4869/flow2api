@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
     config.set_cache_timeout(cache_config.cache_timeout)
     config.set_cache_base_url(cache_config.cache_base_url or "")
 
+    response_config = await db.get_response_config()
+    config.set_response_image_encoding(response_config.image_encoding)
+
     # Load generation configuration from database
     generation_config = await db.get_generation_config()
     config.set_image_timeout(generation_config.image_timeout)

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
+from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, GenerationConfig, CacheConfig, ResponseConfig, Project, CaptchaConfig, PluginConfig, CallLogicConfig
 
 
 class Database:
@@ -63,6 +63,10 @@ class Database:
             return any(col[1] == column_name for col in columns)
         except:
             return False
+
+    def _normalize_image_encoding(self, value: Optional[str]) -> str:
+        normalized = str(value or "").strip().lower()
+        return normalized if normalized in {"url", "base64"} else "url"
 
     async def _ensure_config_rows(self, db, config_dict: dict = None):
         """Ensure all config tables have their default rows
@@ -183,6 +187,21 @@ class Database:
                 VALUES (1, ?, ?, ?)
             """, (cache_enabled, cache_timeout, cache_base_url))
 
+        # Ensure response_config has a row
+        cursor = await db.execute("SELECT COUNT(*) FROM response_config")
+        count = await cursor.fetchone()
+        if count[0] == 0:
+            image_encoding = "url"
+
+            if config_dict:
+                response_config = config_dict.get("response", {})
+                image_encoding = response_config.get("image_encoding", "url")
+
+            await db.execute("""
+                INSERT INTO response_config (id, image_encoding)
+                VALUES (1, ?)
+            """, (self._normalize_image_encoding(image_encoding),))
+
         # Ensure debug_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM debug_config")
         count = await cursor.fetchone()
@@ -280,6 +299,18 @@ class Database:
                         cache_enabled BOOLEAN DEFAULT 0,
                         cache_timeout INTEGER DEFAULT 7200,
                         cache_base_url TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+            # Check and create response_config table if missing
+            if not await self._table_exists(db, "response_config"):
+                print("  Creating missing table: response_config")
+                await db.execute("""
+                    CREATE TABLE response_config (
+                        id INTEGER PRIMARY KEY DEFAULT 1,
+                        image_encoding TEXT DEFAULT 'url',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -622,6 +653,16 @@ class Database:
                     cache_enabled BOOLEAN DEFAULT 0,
                     cache_timeout INTEGER DEFAULT 7200,
                     cache_base_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Response config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS response_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    image_encoding TEXT DEFAULT 'url',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1475,6 +1516,11 @@ class Database:
             config.set_cache_timeout(cache_config.cache_timeout)
             config.set_cache_base_url(cache_config.cache_base_url or "")
 
+        # Reload response config
+        response_config = await self.get_response_config()
+        if response_config:
+            config.set_response_image_encoding(response_config.image_encoding)
+
         # Reload generation config
         generation_config = await self.get_generation_config()
         if generation_config:
@@ -1553,6 +1599,49 @@ class Database:
                     INSERT INTO cache_config (id, cache_enabled, cache_timeout, cache_base_url)
                     VALUES (1, ?, ?, ?)
                 """, (new_enabled, new_timeout, new_base_url))
+
+            await db.commit()
+
+    # Response config operations
+    async def get_response_config(self) -> ResponseConfig:
+        """Get response configuration."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM response_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                payload = dict(row)
+                payload["image_encoding"] = self._normalize_image_encoding(
+                    payload.get("image_encoding")
+                )
+                return ResponseConfig(**payload)
+            return ResponseConfig(image_encoding="url")
+
+    async def update_response_config(self, image_encoding: Optional[str] = None):
+        """Update response configuration."""
+        async with self._connect(write=True) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM response_config WHERE id = 1")
+            row = await cursor.fetchone()
+
+            new_image_encoding = self._normalize_image_encoding(image_encoding)
+            if row:
+                current = dict(row)
+                if image_encoding is None:
+                    new_image_encoding = self._normalize_image_encoding(
+                        current.get("image_encoding", "url")
+                    )
+
+                await db.execute("""
+                    UPDATE response_config
+                    SET image_encoding = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (new_image_encoding,))
+            else:
+                await db.execute("""
+                    INSERT INTO response_config (id, image_encoding)
+                    VALUES (1, ?)
+                """, (new_image_encoding,))
 
             await db.commit()
 

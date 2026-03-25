@@ -25,15 +25,10 @@ def build_openai_completion(content: str) -> str:
     )
 
 
-def test_generate_content_returns_gemini_response(client, fake_handler, monkeypatch):
+def test_generate_content_returns_gemini_file_data_by_default(client, fake_handler):
     fake_handler.non_stream_chunks = [
         build_openai_completion("![Generated Image](https://example.com/generated.png)")
     ]
-
-    async def fake_retrieve_image_data(url: str):
-        return b"\x89PNG\r\n\x1a\nfake"
-
-    monkeypatch.setattr(routes, "retrieve_image_data", fake_retrieve_image_data)
 
     response = client.post(
         "/v1beta/models/gemini-3.0-pro-image:generateContent",
@@ -57,9 +52,40 @@ def test_generate_content_returns_gemini_response(client, fake_handler, monkeypa
     assert fake_handler.calls[0]["model"] == "gemini-3.0-pro-image-landscape-2k"
     body = response.json()
     assert body["modelVersion"] == "gemini-3.0-pro-image"
-    part = body["candidates"][0]["content"]["parts"][0]["inlineData"]
+    part = body["candidates"][0]["content"]["parts"][0]["fileData"]
+    assert part["mimeType"] == "image/png"
+    assert part["fileUri"] == "https://example.com/generated.png"
+    assert response.headers["X-Flow2API-Image-Encoding-Applied"] == "url"
+
+
+def test_generate_content_returns_inline_data_when_requested(client, fake_handler, monkeypatch):
+    fake_handler.non_stream_chunks = [
+        build_openai_completion("![Generated Image](https://example.com/generated.png)")
+    ]
+
+    async def fake_retrieve_image_data(url: str):
+        return b"\x89PNG\r\n\x1a\nfake"
+
+    monkeypatch.setattr(routes, "retrieve_image_data", fake_retrieve_image_data)
+
+    response = client.post(
+        "/v1beta/models/gemini-3.0-pro-image:generateContent",
+        json={
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "draw a mountain"}],
+                }
+            ],
+            "responseImageEncoding": "base64",
+        },
+    )
+
+    assert response.status_code == 200
+    part = response.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
     assert part["mimeType"] == "image/png"
     assert base64.b64decode(part["data"]).startswith(b"\x89PNG")
+    assert response.headers["X-Flow2API-Image-Encoding-Applied"] == "base64"
 
 
 def test_stream_generate_content_returns_sse_chunks(client, fake_handler, monkeypatch):
@@ -81,12 +107,14 @@ def test_stream_generate_content_returns_sse_chunks(client, fake_handler, monkey
                     "role": "user",
                     "parts": [{"text": "draw a city"}],
                 }
-            ]
+            ],
+            "responseImageEncoding": "base64",
         },
     )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["X-Flow2API-Image-Encoding-Applied"] == "base64"
 
     data_lines = [
         line.removeprefix("data: ")
@@ -104,6 +132,31 @@ def test_stream_generate_content_returns_sse_chunks(client, fake_handler, monkey
     image_part = second_chunk["candidates"][0]["content"]["parts"][0]["inlineData"]
     assert image_part["mimeType"] == "image/png"
     assert second_chunk["candidates"][0]["finishReason"] == "STOP"
+
+
+def test_generate_content_prefers_body_image_encoding_over_header(client, fake_handler):
+    fake_handler.non_stream_chunks = [
+        build_openai_completion("![Generated Image](https://example.com/generated.png)")
+    ]
+
+    response = client.post(
+        "/v1beta/models/gemini-3.0-pro-image:generateContent",
+        headers={"X-Flow2API-Image-Encoding": "base64"},
+        json={
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "draw a mountain"}],
+                }
+            ],
+            "responseImageEncoding": "url",
+        },
+    )
+
+    assert response.status_code == 200
+    part = response.json()["candidates"][0]["content"]["parts"][0]["fileData"]
+    assert part["fileUri"] == "https://example.com/generated.png"
+    assert response.headers["X-Flow2API-Image-Encoding-Applied"] == "url"
 
 
 def test_models_generate_content_supports_system_instruction_and_file_data(client, fake_handler):

@@ -3,6 +3,9 @@ import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+VALID_IMAGE_RESPONSE_ENCODINGS = {"url", "base64"}
+
+
 class Config:
     """Application configuration"""
 
@@ -349,6 +352,20 @@ class Config:
             self._config["cache"] = {}
         self._config["cache"]["base_url"] = base_url
 
+    @property
+    def response_image_encoding(self) -> str:
+        """Get image response encoding mode."""
+        value = self._config.get("response", {}).get("image_encoding", "url")
+        return self._normalize_image_response_encoding(value)
+
+    def set_response_image_encoding(self, image_encoding: str):
+        """Set image response encoding mode."""
+        if "response" not in self._config:
+            self._config["response"] = {}
+        self._config["response"]["image_encoding"] = self._normalize_image_response_encoding(
+            image_encoding
+        )
+
     # Captcha configuration
     @property
     def captcha_method(self) -> str:
@@ -517,6 +534,12 @@ class Config:
         except Exception:
             normalized = 60
         self._config["captcha"]["remote_browser_timeout"] = normalized
+
+    def _normalize_image_response_encoding(self, image_encoding: Optional[str]) -> str:
+        value = str(image_encoding or "").strip().lower()
+        if value in VALID_IMAGE_RESPONSE_ENCODINGS:
+            return value
+        return "url"
 
 
 # Global config instance

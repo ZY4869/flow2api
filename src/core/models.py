@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict
 from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
 
+ImageResponseEncoding = Literal["url", "base64"]
+
 
 class Token(BaseModel):
     """Token model for Flow2API"""
@@ -160,6 +162,15 @@ class CacheConfig(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class ResponseConfig(BaseModel):
+    """Response formatting configuration"""
+
+    id: int = 1
+    image_encoding: ImageResponseEncoding = "url"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 class DebugConfig(BaseModel):
     """Debug configuration"""
 
@@ -268,6 +279,7 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
+    responseImageEncoding: Optional[ImageResponseEncoding] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -286,5 +298,6 @@ class ChatCompletionRequest(BaseModel):
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents
+    responseImageEncoding: Optional[ImageResponseEncoding] = None
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields like extra_body passthrough

@@ -2,10 +2,10 @@ version: '3.8'
 
 services:
   flow2api:
-    image: ghcr.io/thesmallhancat/flow2api:latest
+    image: ghcr.io/zy4869/flow2api:latest
     container_name: flow2api
     ports:
-      - "38000:8000"
+      - "8081:8081"
     volumes:
       - ./data:/app/data
       - ./tmp:/app/tmp
