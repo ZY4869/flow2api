@@ -37,15 +37,13 @@
 - 默认 `docker-compose.yml` 建议搭配第三方打码（yescaptcha/capmonster/ezcaptcha/capsolver）。
 如需 Docker 内有头打码（browser/personal），请使用下方 `docker-compose.headed.yml`。
 
-- 自动更新st浏览器拓展：[Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)
-
 ### 方式一：Docker 部署（推荐）
 
 #### 标准模式（不使用代理）
 
 ```bash
 # 克隆项目
-git clone https://github.com/TheSmallHanCat/flow2api.git
+git clone https://github.com/ZY4869/flow2api.git
 cd flow2api
 
 # 启动服务
@@ -61,10 +59,10 @@ docker-compose logs -f
 
 ```bash
 # 使用 WARP 代理启动
-docker-compose -f docker-compose.warp.yml up -d
+docker-compose -f docker-compose.proxy.yml up -d
 
 # 查看日志
-docker-compose -f docker-compose.warp.yml logs -f
+docker-compose -f docker-compose.proxy.yml logs -f
 ```
 
 #### Docker 有头打码模式（browser / personal）
@@ -81,14 +79,14 @@ docker compose -f docker-compose.headed.yml up -d --build
 docker compose -f docker-compose.headed.yml logs -f
 ```
 
-- API 端口：`8000`
+- API 端口：`8081`
 - 进入管理后台后，将验证码方式设为 `browser` 或 `personal`
 
 ### 方式二：本地部署
 
 ```bash
 # 克隆项目
-git clone https://github.com/TheSmallHanCat/flow2api.git
+git clone https://github.com/ZY4869/flow2api.git
 cd flow2api
 
 # 创建虚拟环境
@@ -109,7 +107,7 @@ python main.py
 
 ### 首次访问
 
-服务启动后,访问管理后台: **http://localhost:8000**,首次登录后请立即修改密码!
+服务启动后,访问管理后台: **http://localhost:8081**,首次登录后请立即修改密码!
 
 - **用户名**: `admin`
 - **密码**: `admin`
@@ -200,16 +198,6 @@ python main.py
 #### 多图生成 (R2V - Reference Images to Video)
 🖼️ **支持多张图片**
 
-> **2026-03-06 更新**
->
-> - 已同步上游新版 `R2V` 视频请求体
-> - `textInput` 已切换为 `structuredPrompt.parts`
-> - 顶层新增 `mediaGenerationContext.batchId`
-> - 顶层新增 `useV2ModelConfig: true`
-> - 横屏 / 竖屏 `R2V` 模型共用同一套新版请求体
-> - 横屏 `R2V` 的上游 `videoModelKey` 已切换为 `*_landscape` 形式
-> - 根据当前上游协议，`referenceImages` 当前最多传 **3 张**
-
 | 模型名称 | 说明| 尺寸 |
 |---------|---------|--------|
 | `veo_3_1_r2v_fast_portrait` | 图生视频 | 竖屏 |
@@ -268,7 +256,7 @@ python main.py
 > 如需流式返回，可将路径替换为 `:streamGenerateContent?alt=sse`。
 
 ```bash
-curl -X POST "http://localhost:8000/models/gemini-3.1-flash-image:generateContent" \
+curl -X POST "http://localhost:8081/models/gemini-3.1-flash-image:generateContent" \
   -H "x-goog-api-key: han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -302,7 +290,7 @@ curl -X POST "http://localhost:8000/models/gemini-3.1-flash-image:generateConten
 ### 文生图
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8081/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -320,7 +308,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ### 图生图
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8081/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -349,7 +337,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ### 文生视频
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8081/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -367,7 +355,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ### 首尾帧生成视频
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8081/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -406,7 +394,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 > 当前最多传 **3 张参考图**。
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8081/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -462,12 +450,6 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 
 ## 📞 联系方式
 
-- 提交 Issue：[GitHub Issues](https://github.com/TheSmallHanCat/flow2api/issues)
+- 提交 Issue：[GitHub Issues](https://github.com/ZY4869/flow2api/issues)
 
 ---
-
-**⭐ 如果这个项目对你有帮助，请给个 Star！**
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=TheSmallHanCat/flow2api&type=date&legend=top-left)](https://www.star-history.com/#TheSmallHanCat/flow2api&type=date&legend=top-left)
